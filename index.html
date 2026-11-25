@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SpeakScene — English Speaking Test</title>
+    <meta
+      name="description"
+      content="A three-screen English speaking assessment that generates everyday scenes, transcribes live speech for two minutes, and grades visual descriptions alongside AI-reconstructed imagery."
+    />
+    <meta property="og:title" content="SpeakScene — English Speaking Test" />
+    <meta
+      property="og:description"
+      content="Describe a generated everyday scene aloud in two minutes and compare your spoken description against the original image."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400..700;1,9..40,400..600&family=IBM+Plex+Mono:wght@500;600&family=Plus+Jakarta+Sans:wght@600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <span class="brand">SpeakScene</span>
+        <span class="topbar-meta" aria-label="Assessment mode">
+          English Picture Description
+        </span>
+      </div>
+    </header>
+
+    <main class="app-shell">
+      <!-- Screen 1: Home Screen -->
+      <section id="home-screen" class="screen screen-active" aria-labelledby="home-title">
+        <div class="home-stage">
+          <div class="home-card">
+            <p class="meta-line">
+              <span>2-minute timer</span>
+              <span aria-hidden="true">·</span>
+              <span>10 scene elements</span>
+              <span aria-hidden="true">·</span>
+              <span>Live voice capture</span>
+            </p>
+            <h1 id="home-title" class="home-title">English Speaking Test</h1>
+            <p class="home-subtitle">
+              Observe a freshly generated everyday scene and describe what you see aloud before the
+              two-minute countdown ends. Your spoken words will be graded and turned into a visual
+              comparison.
+            </p>
+            <div class="home-actions">
+              <button id="start-test-btn" class="btn btn-primary btn-large" type="button">
+                Start Test
+              </button>
+            </div>
+            <div id="home-error" class="alert alert-error hidden" role="alert"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 2: Test Screen -->
+      <section id="test-screen" class="screen hidden" aria-labelledby="test-heading">
+        <div class="test-header">
+          <div>
+            <h2 id="test-heading" class="section-title">Describe the Scene Aloud</h2>
+            <p class="section-subtitle">
+              Include the people, animals, trees, water, furniture, and actions you notice.
+            </p>
+          </div>
+          <div class="timer-controls">
+            <div class="timer-box" aria-live="off">
+              <span class="timer-label">Time Remaining</span>
+              <span id="timer-display" class="timer-value">02:00</span>
+            </div>
+            <button id="finish-early-btn" class="btn btn-secondary" type="button">
+              Finish Early
+            </button>
+          </div>
+        </div>
+
+        <div class="timer-track" aria-hidden="true">
+          <div id="timer-progress" class="timer-progress"></div>
+        </div>
+
+        <div id="test-error" class="alert alert-error hidden" role="alert"></div>
+
+        <div class="test-grid">
+          <!-- Left / Top Zone: Question Picture -->
+          <div class="stage-card">
+            <div class="card-header-row">
+              <h3 class="card-title">Question Scene</h3>
+              <span id="scene-status-text" class="status-text">Generating scene...</span>
+            </div>
+            <div class="image-frame" id="question-image-frame">
+              <div id="question-image-loading" class="image-placeholder">
+                <div class="spinner" aria-hidden="true"></div>
+                <p id="question-loading-label">Generating scene description with Gemini...</p>
+              </div>
+              <img
+                id="question-image"
+                class="scene-image hidden"
+                alt="Generated everyday scene to describe"
+                referrerpolicy="no-referrer"
+              />
+              <div id="question-image-fallback" class="image-fallback hidden">
+                <p class="fallback-title">Scene image unavailable</p>
+                <p class="fallback-copy">
+                  The illustration could not be loaded from Pollinations. You can still retry or
+                  restart the test.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right / Bottom Zone: Live Voice Transcript -->
+          <div class="deck-card">
+            <div class="card-header-row">
+              <h3 class="card-title">Live Spoken Transcript</h3>
+              <span id="mic-status" class="mic-status mic-idle">
+                <span class="mic-dot" aria-hidden="true"></span>
+                <span id="mic-status-label">Waiting for microphone</span>
+              </span>
+            </div>
+
+            <div id="speech-warning" class="alert alert-error hidden" role="alert"></div>
+
+            <div
+              id="transcript-box"
+              class="transcript-box"
+              aria-live="polite"
+              aria-label="Live spoken transcription"
+            >
+              <p id="transcript-placeholder" class="transcript-placeholder">
+                Start speaking clearly once the scene appears. Your words will transcribe here
+                automatically.
+              </p>
+              <span id="final-transcript" class="transcript-final"></span>
+              <span id="interim-transcript" class="transcript-interim"></span>
+            </div>
+
+            <div class="deck-footer">
+              <span class="word-count-label">
+                Words spoken: <strong id="word-count" class="tabular-num">0</strong>
+              </span>
+              <button id="cancel-test-btn" class="btn-link" type="button">Return Home</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 3: Results Screen -->
+      <section id="results-screen" class="screen hidden" aria-labelledby="results-heading">
+        <div class="results-top">
+          <div>
+            <p class="meta-line">
+              <span>Assessment Complete</span>
+              <span aria-hidden="true">·</span>
+              <span id="results-elements-meta">Evaluating 10 elements</span>
+            </p>
+            <h2 id="results-heading" class="section-title">Speaking Test Results</h2>
+          </div>
+          <button id="restart-test-btn" class="btn btn-primary" type="button">
+            Take Another Test
+          </button>
+        </div>
+
+        <div id="results-error" class="alert alert-error hidden" role="alert"></div>
+
+        <!-- Score & Feedback Summary -->
+        <div class="score-summary-card">
+          <div class="score-metric-block">
+            <span class="score-caption">Accuracy Score</span>
+            <div id="score-value" class="score-value">--%</div>
+            <span id="score-elements" class="score-sub">Grading response...</span>
+          </div>
+          <div class="score-feedback-block">
+            <h3 class="card-title">Examiner Feedback</h3>
+            <p id="feedback-text" class="feedback-text">
+              Analyzing your spoken description against the 10 key scene elements...
+            </p>
+          </div>
+        </div>
+
+        <!-- Side-by-Side Image Comparison -->
+        <div class="comparison-grid">
+          <article class="stage-card">
+            <div class="card-header-row">
+              <h3 class="card-title">Original Question Picture</h3>
+              <span class="status-text">Reference scene</span>
+            </div>
+            <div class="image-frame">
+              <img
+                id="result-original-image"
+                class="scene-image hidden"
+                alt="Original test scene picture"
+                referrerpolicy="no-referrer"
+              />
+              <div id="result-original-fallback" class="image-fallback hidden">
+                <p class="fallback-title">Original image unavailable</p>
+                <p class="fallback-copy">The original scene image failed to load.</p>
+              </div>
+            </div>
+          </article>
+
+          <article class="stage-card">
+            <div class="card-header-row">
+              <h3 class="card-title">Student's Spoken Picture</h3>
+              <span id="student-image-status" class="status-text">Generating from speech...</span>
+            </div>
+            <div class="image-frame">
+              <div id="student-image-loading" class="image-placeholder">
+                <div class="spinner" aria-hidden="true"></div>
+                <p>Painting a scene from your spoken transcript...</p>
+              </div>
+              <img
+                id="result-student-image"
+                class="scene-image hidden"
+                alt="Image generated from the student's spoken description"
+                referrerpolicy="no-referrer"
+              />
+              <div id="student-image-fallback" class="image-fallback hidden">
+                <p class="fallback-title" id="student-fallback-title">
+                  Generated image unavailable
+                </p>
+                <p class="fallback-copy" id="student-fallback-copy">
+                  No spoken description was captured to illustrate this scene.
+                </p>
+              </div>
+            </div>
+          </article>
+        </div>
+
+        <!-- Transcript & Reference Review -->
+        <div class="review-grid">
+          <div class="deck-card">
+            <h3 class="card-title">Your Spoken Transcript</h3>
+            <p id="result-transcript-text" class="review-prose"></p>
+          </div>
+          <div class="deck-card">
+            <h3 class="card-title">Original 10-Sentence Reference</h3>
+            <p id="result-reference-text" class="review-prose"></p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="./script.js"></script>
+  </body>
+</html>

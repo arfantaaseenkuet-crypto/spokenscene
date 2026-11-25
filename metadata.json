@@ -1,0 +1,6 @@
+{
+  "name": "SpeakScene — English Speaking Test",
+  "description": "A three-screen English speaking assessment that generates everyday scenes, transcribes live speech for two minutes, and grades visual descriptions alongside AI-reconstructed imagery.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
