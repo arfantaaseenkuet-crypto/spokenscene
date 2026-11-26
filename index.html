@@ -67,7 +67,7 @@
           <div>
             <h2 id="test-heading" class="section-title">Describe the Scene Aloud</h2>
             <p class="section-subtitle">
-              Include the people, animals, trees, water, furniture, and actions you notice.
+              Describe the people, what work or event is happening, and the everyday objects you see.
             </p>
           </div>
           <div class="timer-controls">
@@ -127,6 +127,18 @@
 
             <div id="speech-warning" class="alert alert-error hidden" role="alert"></div>
 
+            <div class="mic-meter-row">
+              <span class="mic-meter-label">Mic level</span>
+              <div class="mic-meter-track" aria-hidden="true">
+                <div id="mic-level-bar" class="mic-meter-fill"></div>
+              </div>
+              <select
+                id="mic-device-select"
+                class="mic-device-select hidden"
+                aria-label="Select microphone device"
+              ></select>
+            </div>
+
             <div
               id="transcript-box"
               class="transcript-box"
@@ -134,8 +146,7 @@
               aria-label="Live spoken transcription"
             >
               <p id="transcript-placeholder" class="transcript-placeholder">
-                Start speaking clearly once the scene appears. Your words will transcribe here
-                automatically.
+                Start speaking clearly once the scene appears. Your voice is captured live.
               </p>
               <span id="final-transcript" class="transcript-final"></span>
               <span id="interim-transcript" class="transcript-interim"></span>
@@ -145,7 +156,10 @@
               <span class="word-count-label">
                 Words spoken: <strong id="word-count" class="tabular-num">0</strong>
               </span>
-              <button id="cancel-test-btn" class="btn-link" type="button">Return Home</button>
+              <div class="deck-footer-actions">
+                <button id="restart-mic-btn" class="btn-link" type="button">Restart Mic</button>
+                <button id="cancel-test-btn" class="btn-link" type="button">Return Home</button>
+              </div>
             </div>
           </div>
         </div>
@@ -162,25 +176,40 @@
             </p>
             <h2 id="results-heading" class="section-title">Speaking Test Results</h2>
           </div>
-          <button id="restart-test-btn" class="btn btn-primary" type="button">
-            Take Another Test
-          </button>
+          <div class="results-actions">
+            <button id="export-pdf-btn" class="btn btn-secondary" type="button">
+              Export PDF
+            </button>
+            <button id="restart-test-btn" class="btn btn-primary" type="button">
+              Take Another Test
+            </button>
+          </div>
         </div>
 
-        <div id="results-error" class="alert alert-error hidden" role="alert"></div>
+        <div id="results-error-wrap" class="alert alert-error results-error-wrap hidden" role="alert">
+          <span id="results-error"></span>
+          <button id="retry-grade-btn" class="btn btn-secondary btn-compact" type="button">
+            Retry Grading
+          </button>
+        </div>
 
         <!-- Score & Feedback Summary -->
         <div class="score-summary-card">
           <div class="score-metric-block">
-            <span class="score-caption">Accuracy Score</span>
+            <span class="score-caption">Final Score</span>
             <div id="score-value" class="score-value">--%</div>
             <span id="score-elements" class="score-sub">Grading response...</span>
+            <span id="score-breakdown" class="score-breakdown"></span>
           </div>
           <div class="score-feedback-block">
             <h3 class="card-title">Examiner Feedback</h3>
             <p id="feedback-text" class="feedback-text">
               Analyzing your spoken description against the 10 key scene elements...
             </p>
+            <div id="grammar-mistakes-section" class="grammar-section hidden">
+              <h4 class="grammar-heading">Grammar &amp; Sentence Mistakes (-2% each)</h4>
+              <ul id="grammar-mistakes-list" class="grammar-list"></ul>
+            </div>
           </div>
         </div>
 
@@ -189,7 +218,7 @@
           <article class="stage-card">
             <div class="card-header-row">
               <h3 class="card-title">Original Question Picture</h3>
-              <span class="status-text">Reference scene</span>
+              <span id="result-original-title" class="status-text">Reference scene</span>
             </div>
             <div class="image-frame">
               <img
@@ -203,17 +232,25 @@
                 <p class="fallback-copy">The original scene image failed to load.</p>
               </div>
             </div>
+            <div class="card-audio-bar">
+              <button id="listen-scene-btn" class="btn btn-secondary btn-compact" type="button">
+                Listen to Description
+              </button>
+              <span id="listen-scene-status" class="status-text">
+                Random male or female voice
+              </span>
+            </div>
           </article>
 
           <article class="stage-card">
             <div class="card-header-row">
               <h3 class="card-title">Student's Spoken Picture</h3>
-              <span id="student-image-status" class="status-text">Generating from speech...</span>
+              <span id="student-image-status" class="status-text">Extracting visual keywords...</span>
             </div>
             <div class="image-frame">
               <div id="student-image-loading" class="image-placeholder">
                 <div class="spinner" aria-hidden="true"></div>
-                <p>Painting a scene from your spoken transcript...</p>
+                <p id="student-loading-label">Extracting visual keywords from your speech...</p>
               </div>
               <img
                 id="result-student-image"
@@ -238,14 +275,186 @@
           <div class="deck-card">
             <h3 class="card-title">Your Spoken Transcript</h3>
             <p id="result-transcript-text" class="review-prose"></p>
+            <p id="result-student-keywords" class="review-keywords hidden"></p>
           </div>
           <div class="deck-card">
-            <h3 class="card-title">Original 10-Sentence Reference</h3>
-            <p id="result-reference-text" class="review-prose"></p>
+            <h3 class="card-title">Scene Keypoints &amp; Reference</h3>
+            <p id="result-scene-keywords" class="review-keywords"></p>
+            <ol id="result-reference-list" class="reference-list"></ol>
+          </div>
+        </div>
+      </section>
+
+      <!-- Screen 4: Teacher Portal (accessible via #teacher) -->
+      <section id="forms-screen" class="screen hidden" aria-labelledby="forms-heading">
+        <div class="results-top">
+          <div>
+            <p class="meta-line">
+              <span>Teacher Portal</span>
+              <span aria-hidden="true">·</span>
+              <span>Student Transcripts &amp; Google Workspace</span>
+            </p>
+            <h2 id="forms-heading" class="section-title">Student Answers &amp; Google Forms</h2>
+          </div>
+          <div class="results-actions">
+            <div id="google-user-wrap" class="google-user-wrap hidden">
+              <span id="google-user-email" class="topbar-meta"></span>
+              <button id="google-signout-btn" class="btn-link" type="button">Sign out</button>
+            </div>
+            <button id="forms-back-btn" class="btn btn-secondary" type="button">
+              Exit Teacher View
+            </button>
+          </div>
+        </div>
+
+        <div id="forms-auth-prompt" class="home-card forms-auth-card hidden">
+          <h3 class="card-title">Teacher Sign-In Required</h3>
+          <p class="forms-auth-copy">
+            Sign in with your Google account to view automatically saved student spoken
+            transcripts, save student PDFs to your Google Drive, and inspect your Google Forms.
+          </p>
+          <div class="home-actions">
+            <button id="forms-panel-signin-btn" class="gsi-material-button" type="button">
+              <div class="gsi-material-button-state"></div>
+              <div class="gsi-material-button-content-wrapper">
+                <div class="gsi-material-button-icon">
+                  <svg
+                    version="1.1"
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 48 48"
+                    xmlns:xlink="http://www.w3.org/1999/xlink"
+                    style="display: block"
+                  >
+                    <path
+                      fill="#EA4335"
+                      d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
+                    ></path>
+                    <path
+                      fill="#4285F4"
+                      d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
+                    ></path>
+                    <path
+                      fill="#FBBC05"
+                      d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
+                    ></path>
+                    <path
+                      fill="#34A853"
+                      d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
+                    ></path>
+                    <path fill="none" d="M0 0h48v48H0z"></path>
+                  </svg>
+                </div>
+                <span class="gsi-material-button-contents">Sign in with Google</span>
+                <span style="display: none">Sign in with Google</span>
+              </div>
+            </button>
+          </div>
+        </div>
+
+        <div id="forms-workspace-content" class="hidden">
+          <div id="forms-error" class="alert alert-error hidden" role="alert"></div>
+          <div id="forms-status" class="alert alert-success hidden" role="status"></div>
+
+          <div class="review-grid">
+            <!-- Left Card: Student Transcripts & PDF Drive Save -->
+            <div class="deck-card">
+              <div class="card-header-row">
+                <h3 class="card-title">Student Spoken Transcripts</h3>
+                <button
+                  id="refresh-submissions-btn"
+                  class="btn btn-secondary btn-compact"
+                  type="button"
+                >
+                  Refresh
+                </button>
+              </div>
+              <div id="submissions-list" class="forms-list">
+                <p class="forms-empty-text">No student transcripts recorded yet.</p>
+              </div>
+            </div>
+
+            <!-- Right Card: Teacher Google Forms & Responses -->
+            <div class="deck-card">
+              <div class="card-header-row">
+                <h3 class="card-title">Your Google Forms</h3>
+                <div class="forms-link-group">
+                  <button id="refresh-forms-btn" class="btn btn-secondary btn-compact" type="button">
+                    Refresh
+                  </button>
+                  <button
+                    id="create-practice-form-btn"
+                    class="btn btn-primary btn-compact"
+                    type="button"
+                  >
+                    New Form
+                  </button>
+                </div>
+              </div>
+              <div id="forms-list" class="forms-list">
+                <p class="forms-empty-text">Click Refresh to load your Google Forms.</p>
+              </div>
+
+              <div class="grammar-section">
+                <div class="card-header-row">
+                  <h4 class="grammar-heading">Selected Form Details</h4>
+                  <span id="form-detail-count" class="status-text">Select a form</span>
+                </div>
+                <p id="form-detail-empty" class="forms-empty-text">
+                  Select any Google Form above to view its questions and responses.
+                </p>
+                <div id="form-detail-body" class="hidden">
+                  <div class="form-detail-header">
+                    <h4 id="form-detail-title" class="form-detail-title"></h4>
+                    <div class="forms-link-group">
+                      <a
+                        id="form-open-link"
+                        class="btn btn-secondary btn-compact"
+                        href="#"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        Open Form
+                      </a>
+                      <a
+                        id="form-edit-link"
+                        class="btn btn-secondary btn-compact"
+                        href="#"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        Edit
+                      </a>
+                    </div>
+                  </div>
+                  <h5 class="grammar-heading">Questions</h5>
+                  <ol id="form-items-list" class="reference-list"></ol>
+                  <div class="grammar-section">
+                    <h5 class="grammar-heading">Form Responses</h5>
+                    <ul id="form-responses-list" class="grammar-list"></ul>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </section>
     </main>
+
+    <!-- Custom Confirmation Modal for Google Forms Mutations -->
+    <div id="confirm-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title">
+      <div class="modal-card">
+        <h3 id="confirm-modal-title" class="card-title">Confirm Action</h3>
+        <p id="confirm-modal-body" class="modal-body"></p>
+        <div class="modal-actions">
+          <button id="confirm-modal-cancel" class="btn btn-secondary btn-compact" type="button">
+            Cancel
+          </button>
+          <button id="confirm-modal-ok" class="btn btn-primary btn-compact" type="button">
+            Confirm
+          </button>
+        </div>
+      </div>
+    </div>
 
     <script type="module" src="./script.js"></script>
   </body>
