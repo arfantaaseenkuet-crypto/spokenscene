@@ -786,7 +786,7 @@ async function startServer(): Promise<void> {
           },
         };
         const instructionPart = {
-          text: 'Transcribe the English speech in this audio recording accurately. Output only the spoken words as plain text with no commentary. If there is no clear speech, output an empty string.',
+          text: 'Transcribe only the clear English speech in this audio clip accurately as plain text with natural punctuation. Do not add commentary, speaker labels, timestamps, or brackets. If there is no clear speech, output an empty string.',
         };
 
         const modelsToTry = ['gemini-3.5-transcribe', PRIMARY_MODEL];
@@ -802,7 +802,11 @@ async function startServer(): Promise<void> {
                 ? { config: { thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL } } }
                 : {}),
             });
-            transcript = (response.text || '').trim();
+            const rawText = (response.text || '').trim();
+            transcript = rawText
+              .replace(/^\[(silence|no speech|inaudible|background noise|music|blank_audio)\]$/gi, '')
+              .replace(/^\((silence|no speech|inaudible|background noise|music)\)$/gi, '')
+              .trim();
             lastErr = null;
             break;
           } catch (err) {

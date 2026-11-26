@@ -16,6 +16,9 @@ import {
 
 const TEST_DURATION_SECONDS = 120;
 const DEVICE_SCENE_COUNTS_KEY = 'speakscene_device_counts_v1';
+const IS_MOBILE_BROWSER = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+  typeof navigator !== 'undefined' ? navigator.userAgent || '' : ''
+);
 
 const state = {
   currentScreen: 'home',
@@ -33,13 +36,19 @@ const state = {
   remainingSeconds: TEST_DURATION_SECONDS,
   isTesting: false,
   timerStarted: false,
+  sessionGeneration: 0,
   hasFatalSpeechError: false,
   hasNativeSpeechResult: false,
   lastLiveSpeechResultAt: 0,
-  speechDetectedSinceLastSync: false,
-  isLiveTranscribing: false,
-  liveTranscribeInterval: null,
-  prefixTranscript: '',
+  transcribeQueue: Promise.resolve(),
+  pendingTranscribeCount: 0,
+  pcmCaptureEnabled: false,
+  pcmProducedTranscript: false,
+  pcmPreRollChunks: [],
+  currentSegmentChunks: [],
+  currentSegmentSamples: 0,
+  segmentHasSpeech: false,
+  segmentSilenceMs: 0,
   isAudioRecording: false,
   selectedDeviceId: '',
   recordedMimeType: 'audio/webm',
@@ -48,6 +57,9 @@ const state = {
   mediaRecorder: null,
   audioContext: null,
   analyserNode: null,
+  pcmSource: null,
+  pcmProcessor: null,
+  pcmSilentGain: null,
   meterRafId: null,
   recognition: null,
   timerInterval: null,
@@ -228,11 +240,54 @@ function updateTranscriptDisplay() {
   dom.transcriptBox.scrollTop = dom.transcriptBox.scrollHeight;
 }
 
+function appendTranscriptText(newSegment) {
+  const clean = String(newSegment || '').replace(/\s+/g, ' ').trim();
+  if (!clean) return;
+
+  const existing = state.finalTranscript.trim();
+  if (!existing) {
+    state.finalTranscript = clean;
+    updateTranscriptDisplay();
+    return;
+  }
+
+  const normalizeWord = (w) => w.toLowerCase().replace(/^[^a-z0-9']+|[^a-z0-9']+$/gi, '');
+  const existingWords = existing.split(/\s+/);
+  const newWords = clean.split(/\s+/);
+
+  // If the exact phrase just appeared at the tail (e.g. mobile SpeechRecognition repeat), skip duplicating
+  if (newWords.length <= existingWords.length) {
+    const tailNorm = existingWords.slice(-newWords.length).map(normalizeWord).join(' ');
+    const newNorm = newWords.map(normalizeWord).join(' ');
+    if (newNorm && tailNorm === newNorm) {
+      return;
+    }
+  }
+
+  // Deduplicate 1-4 word boundary overlap without ever deleting any existing words
+  const maxOverlap = Math.min(4, existingWords.length, newWords.length);
+  let overlapCount = 0;
+  for (let len = maxOverlap; len >= 1; len -= 1) {
+    const tailSlice = existingWords.slice(-len).map(normalizeWord).join(' ');
+    const headSlice = newWords.slice(0, len).map(normalizeWord).join(' ');
+    if (tailSlice && tailSlice === headSlice) {
+      overlapCount = len;
+      break;
+    }
+  }
+
+  const remainder = newWords.slice(overlapCount).join(' ').trim();
+  if (!remainder) return;
+
+  state.finalTranscript = `${existing} ${remainder}`.trim();
+  updateTranscriptDisplay();
+}
+
 function commitInterimTranscript() {
   if (state.interimTranscript) {
-    state.finalTranscript = `${state.finalTranscript} ${state.interimTranscript}`.trim();
+    const pending = state.interimTranscript;
     state.interimTranscript = '';
-    updateTranscriptDisplay();
+    appendTranscriptText(pending);
   }
 }
 
@@ -315,13 +370,199 @@ function startCountdownTimer() {
   }, 1000);
 }
 
+function ensureAudioContext() {
+  const AudioCtx = window.AudioContext || window['webkitAudioContext'];
+  if (!AudioCtx) return null;
+  try {
+    if (!state.audioContext || state.audioContext.state === 'closed') {
+      state.audioContext = new AudioCtx();
+    }
+    if (state.audioContext.state === 'suspended') {
+      state.audioContext.resume().catch(() => {});
+    }
+    return state.audioContext;
+  } catch {
+    return null;
+  }
+}
+
+function downsampleTo16kInt16(float32Buffer, inputSampleRate) {
+  const targetRate = 16000;
+  if (!float32Buffer || float32Buffer.length === 0) {
+    return new Int16Array(0);
+  }
+  if (inputSampleRate === targetRate) {
+    const out = new Int16Array(float32Buffer.length);
+    for (let i = 0; i < float32Buffer.length; i += 1) {
+      const s = Math.max(-1, Math.min(1, float32Buffer[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    return out;
+  }
+
+  const ratio = inputSampleRate / targetRate;
+  const outputLength = Math.max(1, Math.floor(float32Buffer.length / ratio));
+  const out = new Int16Array(outputLength);
+  for (let i = 0; i < outputLength; i += 1) {
+    const start = Math.floor(i * ratio);
+    const end = Math.min(float32Buffer.length, Math.floor((i + 1) * ratio));
+    let sum = 0;
+    let count = 0;
+    for (let j = start; j < end; j += 1) {
+      sum += float32Buffer[j];
+      count += 1;
+    }
+    const sample = count > 0 ? sum / count : float32Buffer[start] || 0;
+    const clamped = Math.max(-1, Math.min(1, sample));
+    out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+  }
+  return out;
+}
+
+function encodeWavBlob(int16Chunks, sampleRate = 16000) {
+  let totalSamples = 0;
+  for (const chunk of int16Chunks) {
+    totalSamples += chunk.length;
+  }
+
+  const dataByteLength = totalSamples * 2;
+  const buffer = new ArrayBuffer(44 + dataByteLength);
+  const view = new DataView(buffer);
+
+  const writeString = (offset, str) => {
+    for (let i = 0; i < str.length; i += 1) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + dataByteLength, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, 'data');
+  view.setUint32(40, dataByteLength, true);
+
+  let offset = 44;
+  for (const chunk of int16Chunks) {
+    for (let i = 0; i < chunk.length; i += 1) {
+      view.setInt16(offset, chunk[i], true);
+      offset += 2;
+    }
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+function resetPcmSegmentBuffer() {
+  state.pcmPreRollChunks = [];
+  state.currentSegmentChunks = [];
+  state.currentSegmentSamples = 0;
+  state.segmentHasSpeech = false;
+  state.segmentSilenceMs = 0;
+}
+
+function flushCurrentPcmSegment(forceFlush = false) {
+  const minSamples = forceFlush ? 16000 * 0.35 : 16000 * 0.6;
+  if (!state.segmentHasSpeech || state.currentSegmentSamples < minSamples) {
+    resetPcmSegmentBuffer();
+    return;
+  }
+
+  const chunks = state.currentSegmentChunks.slice();
+  resetPcmSegmentBuffer();
+
+  const wavBlob = encodeWavBlob(chunks, 16000);
+  if (wavBlob.size < 2000) return;
+
+  const gen = state.sessionGeneration;
+  state.pendingTranscribeCount += 1;
+  if (state.isTesting) {
+    setMicState('listening', 'Listening — updating transcript...');
+  }
+
+  state.transcribeQueue = state.transcribeQueue
+    .then(async () => {
+      if (state.sessionGeneration !== gen) return;
+      let text = '';
+      try {
+        text = await transcribeRecordedAudio(wavBlob, 'audio/wav');
+      } catch {
+        // Quick single retry for transient network hiccups
+        if (state.sessionGeneration === gen) {
+          try {
+            text = await transcribeRecordedAudio(wavBlob, 'audio/wav');
+          } catch {
+            text = '';
+          }
+        }
+      }
+
+      if (state.sessionGeneration !== gen) return;
+      if (text) {
+        state.pcmProducedTranscript = true;
+        appendTranscriptText(text);
+        if (state.currentScreen === 'results') {
+          dom.resultTranscriptText.textContent = state.finalTranscript;
+        }
+      }
+    })
+    .finally(() => {
+      state.pendingTranscribeCount = Math.max(0, state.pendingTranscribeCount - 1);
+      if (
+        state.sessionGeneration === gen &&
+        state.isTesting &&
+        state.pendingTranscribeCount === 0 &&
+        state.isAudioRecording
+      ) {
+        const useAiLabel =
+          IS_MOBILE_BROWSER ||
+          state.hasFatalSpeechError ||
+          !(window.SpeechRecognition || window['webkitSpeechRecognition']);
+        setMicState('listening', useAiLabel ? 'Listening (Live voice capture)' : 'Listening');
+      }
+    });
+}
+
 function stopAudioMeterAndStreams() {
+  state.pcmCaptureEnabled = false;
   if (state.meterRafId !== null) {
     window.cancelAnimationFrame(state.meterRafId);
     state.meterRafId = null;
   }
   if (dom.micLevelBar) {
     dom.micLevelBar.style.transform = 'scaleX(0)';
+  }
+  if (state.pcmProcessor) {
+    state.pcmProcessor.onaudioprocess = null;
+    try {
+      state.pcmProcessor.disconnect();
+    } catch {
+      // Ignore disconnect errors
+    }
+    state.pcmProcessor = null;
+  }
+  if (state.pcmSilentGain) {
+    try {
+      state.pcmSilentGain.disconnect();
+    } catch {
+      // Ignore disconnect errors
+    }
+    state.pcmSilentGain = null;
+  }
+  if (state.pcmSource) {
+    try {
+      state.pcmSource.disconnect();
+    } catch {
+      // Ignore disconnect errors
+    }
+    state.pcmSource = null;
   }
   if (state.mediaStream) {
     state.mediaStream.getTracks().forEach((track) => track.stop());
@@ -335,6 +576,7 @@ function stopAudioMeterAndStreams() {
       ctx.close().catch(() => {});
     }
   }
+  resetPcmSegmentBuffer();
   state.isAudioRecording = false;
 }
 
@@ -385,115 +627,150 @@ async function populateMicDevices(activeStream) {
   }
 }
 
-function startAudioMeter(stream) {
-  const AudioCtx = window.AudioContext || window['webkitAudioContext'];
-  if (!AudioCtx || !dom.micLevelBar) return;
+function startAudioMeterAndPcm(stream) {
+  const audioContext = ensureAudioContext();
+  if (!audioContext) return false;
 
   try {
-    const audioContext = new AudioCtx();
-    if (audioContext.state === 'suspended') {
-      audioContext.resume().catch(() => {});
-    }
     const source = audioContext.createMediaStreamSource(stream);
     const analyser = audioContext.createAnalyser();
     analyser.fftSize = 256;
     source.connect(analyser);
 
-    state.audioContext = audioContext;
+    state.pcmSource = source;
     state.analyserNode = analyser;
 
-    const dataArray = new Uint8Array(analyser.fftSize);
-    const tick = () => {
-      if (!state.isTesting || !state.analyserNode || !dom.micLevelBar) {
-        return;
-      }
-      state.analyserNode.getByteTimeDomainData(dataArray);
-      let sumSquares = 0;
-      for (let i = 0; i < dataArray.length; i += 1) {
-        const normalized = (dataArray[i] - 128) / 128;
-        sumSquares += normalized * normalized;
-      }
-      const rms = Math.sqrt(sumSquares / dataArray.length);
-      if (rms > 0.012) {
-        state.speechDetectedSinceLastSync = true;
-      }
-      const level = Math.min(1, Math.max(0, rms * 4.5));
-      dom.micLevelBar.style.transform = `scaleX(${level.toFixed(3)})`;
+    if (typeof audioContext.createScriptProcessor === 'function') {
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      const silentGain = audioContext.createGain();
+      silentGain.gain.value = 0;
+
+      source.connect(processor);
+      processor.connect(silentGain);
+      silentGain.connect(audioContext.destination);
+
+      state.pcmProcessor = processor;
+      state.pcmSilentGain = silentGain;
+      state.pcmCaptureEnabled = true;
+
+      const sampleRate = audioContext.sampleRate || 48000;
+      const chunkDurationMs = (4096 / sampleRate) * 1000;
+
+      processor.onaudioprocess = (event) => {
+        if (!state.isTesting || !state.pcmCaptureEnabled) return;
+
+        const inputData = event.inputBuffer.getChannelData(0);
+        let sumSquares = 0;
+        for (let i = 0; i < inputData.length; i += 1) {
+          const s = inputData[i];
+          sumSquares += s * s;
+        }
+        const rms = Math.sqrt(sumSquares / inputData.length);
+
+        const nativeRecentlyActive =
+          !IS_MOBILE_BROWSER &&
+          !state.hasFatalSpeechError &&
+          state.hasNativeSpeechResult &&
+          Date.now() - state.lastLiveSpeechResultAt < 3500;
+
+        const int16Chunk = downsampleTo16kInt16(inputData, sampleRate);
+        if (int16Chunk.length === 0) return;
+
+        if (nativeRecentlyActive) {
+          state.pcmPreRollChunks.push(int16Chunk);
+          if (state.pcmPreRollChunks.length > 4) {
+            state.pcmPreRollChunks.shift();
+          }
+          if (state.segmentHasSpeech) {
+            state.currentSegmentChunks = [];
+            state.currentSegmentSamples = 0;
+            state.segmentHasSpeech = false;
+            state.segmentSilenceMs = 0;
+          }
+          return;
+        }
+
+        const isSpeechFrame = rms > 0.011;
+        if (!state.segmentHasSpeech) {
+          state.pcmPreRollChunks.push(int16Chunk);
+          if (state.pcmPreRollChunks.length > 4) {
+            state.pcmPreRollChunks.shift();
+          }
+          if (isSpeechFrame) {
+            state.segmentHasSpeech = true;
+            state.segmentSilenceMs = 0;
+            state.currentSegmentChunks = state.pcmPreRollChunks.slice();
+            state.currentSegmentSamples = state.currentSegmentChunks.reduce(
+              (acc, c) => acc + c.length,
+              0
+            );
+            state.pcmPreRollChunks = [];
+          }
+          return;
+        }
+
+        state.currentSegmentChunks.push(int16Chunk);
+        state.currentSegmentSamples += int16Chunk.length;
+
+        if (isSpeechFrame) {
+          state.segmentSilenceMs = 0;
+        } else {
+          state.segmentSilenceMs += chunkDurationMs;
+        }
+
+        const reachedNaturalPause =
+          state.currentSegmentSamples >= 16000 * 1.0 && state.segmentSilenceMs >= 650;
+        const reachedMaxLength = state.currentSegmentSamples >= 16000 * 4.5;
+
+        if (reachedNaturalPause || reachedMaxLength) {
+          flushCurrentPcmSegment(false);
+        }
+      };
+    }
+
+    if (dom.micLevelBar) {
+      const dataArray = new Uint8Array(analyser.fftSize);
+      const tick = () => {
+        if (!state.isTesting || !state.analyserNode || !dom.micLevelBar) {
+          return;
+        }
+        state.analyserNode.getByteTimeDomainData(dataArray);
+        let sumSquares = 0;
+        for (let i = 0; i < dataArray.length; i += 1) {
+          const normalized = (dataArray[i] - 128) / 128;
+          sumSquares += normalized * normalized;
+        }
+        const rms = Math.sqrt(sumSquares / dataArray.length);
+        const level = Math.min(1, Math.max(0, rms * 4.5));
+        dom.micLevelBar.style.transform = `scaleX(${level.toFixed(3)})`;
+        state.meterRafId = window.requestAnimationFrame(tick);
+      };
       state.meterRafId = window.requestAnimationFrame(tick);
-    };
+    }
 
-    state.meterRafId = window.requestAnimationFrame(tick);
+    return true;
   } catch {
-    // Web Audio meter unavailable; recording still proceeds
+    return false;
   }
-}
-
-function stopLiveTranscribeLoop() {
-  if (state.liveTranscribeInterval !== null) {
-    window.clearInterval(state.liveTranscribeInterval);
-    state.liveTranscribeInterval = null;
-  }
-}
-
-function startLiveTranscribeLoop() {
-  stopLiveTranscribeLoop();
-  state.liveTranscribeInterval = window.setInterval(async () => {
-    const nativeRecentlyActive =
-      state.hasNativeSpeechResult && Date.now() - state.lastLiveSpeechResultAt < 5500;
-    if (
-      !state.isTesting ||
-      !state.isAudioRecording ||
-      nativeRecentlyActive ||
-      state.isLiveTranscribing ||
-      !state.speechDetectedSinceLastSync ||
-      state.recordedChunks.length === 0
-    ) {
-      return;
-    }
-
-    const mimeType = state.recordedMimeType || 'audio/webm';
-    const snapshotBlob = new Blob(state.recordedChunks.slice(), { type: mimeType });
-    if (snapshotBlob.size < 1500) {
-      return;
-    }
-
-    state.isLiveTranscribing = true;
-    state.speechDetectedSinceLastSync = false;
-    setMicState('listening', 'Listening — transcribing live...');
-
-    try {
-      const liveText = await transcribeRecordedAudio(snapshotBlob, mimeType);
-      const stillNativeQuiet =
-        !state.hasNativeSpeechResult || Date.now() - state.lastLiveSpeechResultAt >= 5500;
-      if (state.isTesting && stillNativeQuiet && liveText) {
-        state.finalTranscript = state.prefixTranscript
-          ? `${state.prefixTranscript} ${liveText}`.trim()
-          : liveText;
-        updateTranscriptDisplay();
-      }
-    } catch {
-      // Keep recording silently; final pass on finishTest will retry
-    } finally {
-      state.isLiveTranscribing = false;
-      if (state.isTesting && !state.hasNativeSpeechResult && state.isAudioRecording) {
-        setMicState('listening', 'Listening (AI live transcript)');
-      }
-    }
-  }, 4500);
 }
 
 async function startAudioCapture(deviceId = '') {
-  if (state.isTesting && state.finalTranscript.trim()) {
-    state.prefixTranscript = state.finalTranscript.trim();
+  if (state.isTesting) {
+    flushCurrentPcmSegment(true);
   }
   abortAudioCapture();
+  ensureAudioContext();
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    if (state.hasFatalSpeechError || !(window.SpeechRecognition || window['webkitSpeechRecognition'])) {
+    if (
+      state.hasFatalSpeechError ||
+      IS_MOBILE_BROWSER ||
+      !(window.SpeechRecognition || window['webkitSpeechRecognition'])
+    ) {
       setMicState('error', 'Microphone unsupported');
       showError(
         dom.speechWarning,
-        'Microphone capture is not available in this browser or preview frame. Open the app in Chrome or Edge over HTTPS.'
+        'Microphone capture is not available in this browser or preview frame. Open the app in Chrome, Safari, or Edge over HTTPS.'
       );
     }
     return { ok: false, error: 'unsupported' };
@@ -533,7 +810,7 @@ async function startAudioCapture(deviceId = '') {
 
   state.mediaStream = stream;
   await populateMicDevices(stream);
-  startAudioMeter(stream);
+  const pcmActive = startAudioMeterAndPcm(stream);
 
   const preferredMimes = [
     'audio/webm;codecs=opus',
@@ -562,17 +839,22 @@ async function startAudioCapture(deviceId = '') {
       state.mediaRecorder = recorder;
       state.isAudioRecording = true;
     } catch {
-      state.isAudioRecording = false;
+      state.isAudioRecording = pcmActive;
     }
+  } else {
+    state.isAudioRecording = pcmActive;
   }
 
   if (state.isAudioRecording) {
     hideError(dom.speechWarning);
-    startLiveTranscribeLoop();
-    if (state.hasFatalSpeechError || !(window.SpeechRecognition || window['webkitSpeechRecognition'])) {
-      setMicState('listening', 'Listening (AI live transcript)');
+    const useAiLabel =
+      IS_MOBILE_BROWSER ||
+      state.hasFatalSpeechError ||
+      !(window.SpeechRecognition || window['webkitSpeechRecognition']);
+    if (useAiLabel) {
+      setMicState('listening', 'Listening (Live voice capture)');
       dom.transcriptPlaceholder.textContent =
-        'Speak clearly once the scene appears — live transcript updates every few seconds.';
+        'Speak clearly once the scene appears — your sentences appear live as you speak.';
     } else if (!state.finalTranscript && !state.interimTranscript) {
       setMicState('listening', 'Mic active — speak now');
     }
@@ -679,15 +961,21 @@ async function transcribeRecordedAudio(blob, mimeType) {
 }
 
 function startSpeechRecognition() {
+  if (IS_MOBILE_BROWSER) {
+    // Mobile browsers suffer hardware mic contention and duplicate/vanishing SpeechRecognition results when recording simultaneously
+    state.hasFatalSpeechError = true;
+    return;
+  }
+
   const SpeechRecognitionCtor = window.SpeechRecognition || window['webkitSpeechRecognition'];
 
   if (!SpeechRecognitionCtor) {
     state.hasFatalSpeechError = true;
     if (state.isAudioRecording) {
       hideError(dom.speechWarning);
-      setMicState('listening', 'Recording voice (AI transcription ready)');
+      setMicState('listening', 'Listening (Live voice capture)');
       dom.transcriptPlaceholder.textContent =
-        'Recording your voice... Your speech will be transcribed automatically when you finish.';
+        'Speak clearly once the scene appears — your sentences appear live as you speak.';
     } else {
       setMicState('idle', 'Starting audio recorder...');
     }
@@ -734,7 +1022,8 @@ function startSpeechRecognition() {
       const result = event.results[i];
       const transcriptPiece = result[0]?.transcript || '';
       if (result.isFinal) {
-        state.finalTranscript = `${state.finalTranscript} ${transcriptPiece}`.trim();
+        appendTranscriptText(transcriptPiece);
+        resetPcmSegmentBuffer();
       } else {
         interim += transcriptPiece;
       }
@@ -756,9 +1045,9 @@ function startSpeechRecognition() {
     ) {
       state.hasFatalSpeechError = true;
       hideError(dom.speechWarning);
-      setMicState('listening', 'Listening (AI live transcript)');
+      setMicState('listening', 'Listening (Live voice capture)');
       dom.transcriptPlaceholder.textContent =
-        'Speak clearly once the scene appears — live transcript updates every few seconds.';
+        'Speak clearly once the scene appears — your sentences appear live as you speak.';
       return;
     }
 
@@ -779,7 +1068,7 @@ function startSpeechRecognition() {
     } else if (event.error === 'network') {
       state.hasFatalSpeechError = true;
       if (state.isAudioRecording) {
-        setMicState('listening', 'Recording voice (AI transcription ready)');
+        setMicState('listening', 'Listening (Live voice capture)');
       } else {
         setMicState('error', 'Speech network error');
         showError(
@@ -818,7 +1107,7 @@ function startSpeechRecognition() {
     recognition.start();
   } catch (_err) {
     if (state.isAudioRecording) {
-      setMicState('listening', 'Recording voice (AI transcription ready)');
+      setMicState('listening', 'Listening (Live voice capture)');
     } else {
       setMicState('error', 'Unable to start mic');
       showError(dom.speechWarning, 'Could not start speech capture. Click Restart Mic to try again.');
@@ -850,10 +1139,10 @@ function cleanupTimers() {
     window.clearTimeout(state.imageFallbackTimer);
     state.imageFallbackTimer = null;
   }
-  stopLiveTranscribeLoop();
 }
 
 function resetTestView() {
+  state.sessionGeneration += 1;
   cleanupTimers();
   stopSpeechRecognition();
   abortAudioCapture();
@@ -873,9 +1162,10 @@ function resetTestView() {
   state.hasFatalSpeechError = false;
   state.hasNativeSpeechResult = false;
   state.lastLiveSpeechResultAt = 0;
-  state.speechDetectedSinceLastSync = false;
-  state.isLiveTranscribing = false;
-  state.prefixTranscript = '';
+  state.pendingTranscribeCount = 0;
+  state.transcribeQueue = Promise.resolve();
+  state.pcmProducedTranscript = false;
+  resetPcmSegmentBuffer();
 
   hideError(dom.testError);
   hideError(dom.speechWarning);
@@ -1416,7 +1706,8 @@ async function startTest() {
   showScreen('test');
   state.isTesting = true;
 
-  // Start live speech recognition synchronously and MediaRecorder capture concurrently inside click gesture
+  // Warm up AudioContext synchronously inside user click gesture (critical for iOS/Safari & mobile Chrome)
+  ensureAudioContext();
   startSpeechRecognition();
   startAudioCapture(state.selectedDeviceId);
 
@@ -1546,18 +1837,17 @@ async function runGradingFlow(spokenText) {
 async function finishTest() {
   if (!state.isTesting) return;
 
+  const gen = state.sessionGeneration;
   state.isTesting = false;
   dom.finishEarlyBtn.disabled = true;
   cleanupTimers();
   commitInterimTranscript();
   stopSpeechRecognition();
+  flushCurrentPcmSegment(true);
   setMicState('idle', 'Finishing recording...');
 
   const audioCapture = await stopAudioCaptureAndGetBlob();
   setMicState('idle', 'Recording stopped');
-
-  const liveText = state.finalTranscript.trim();
-  const liveWordCount = liveText ? liveText.split(/\s+/).filter(Boolean).length : 0;
 
   showScreen('results');
   dom.resultsErrorWrap.classList.add('hidden');
@@ -1579,18 +1869,38 @@ async function finishTest() {
     dom.resultOriginalFallback.classList.remove('hidden');
   }
 
-  let spokenText = liveText;
+  // Always preserve everything already transcribed; never overwrite existing live sentences
+  dom.resultTranscriptText.textContent =
+    state.finalTranscript.trim() || 'Finalizing spoken transcript...';
+
   let transcriptionError = '';
 
-  if ((!state.hasNativeSpeechResult || liveWordCount < 3) && audioCapture.blob && audioCapture.blob.size > 1000) {
+  if (state.pendingTranscribeCount > 0) {
+    dom.scoreValue.textContent = '--%';
+    dom.scoreElements.textContent = 'Finalizing speech...';
+    dom.scoreBreakdown.textContent = '';
+    dom.resultsElementsMeta.textContent = 'Finalizing spoken transcript';
+    dom.feedbackText.textContent = 'Finishing the last spoken words before grading...';
+    dom.grammarMistakesSection.classList.add('hidden');
+    dom.resultStudentKeywords.classList.add('hidden');
+    dom.studentImageStatus.textContent = 'Waiting for transcript...';
+    dom.studentLoadingLabel.textContent = 'Finalizing your spoken transcript...';
+    dom.studentImageLoading.classList.remove('hidden');
+    dom.resultStudentImage.classList.add('hidden');
+    dom.studentImageFallback.classList.add('hidden');
+
+    await state.transcribeQueue;
+    if (state.sessionGeneration !== gen) return;
+  }
+
+  // Backup: only transcribe MediaRecorder blob if live capture produced 0 words
+  if (!state.finalTranscript.trim() && audioCapture.blob && audioCapture.blob.size > 1500) {
     dom.scoreValue.textContent = '--%';
     dom.scoreElements.textContent = 'Transcribing voice...';
     dom.scoreBreakdown.textContent = '';
     dom.resultsElementsMeta.textContent = 'Finalizing spoken transcript';
-    dom.feedbackText.textContent = 'Finalizing your recorded voice transcript before grading...';
-    dom.resultTranscriptText.textContent = liveText
-      ? `${liveText} (finalizing...)`
-      : 'Transcribing recorded speech...';
+    dom.feedbackText.textContent = 'Transcribing your recorded voice before grading...';
+    dom.resultTranscriptText.textContent = 'Transcribing recorded speech...';
     dom.grammarMistakesSection.classList.add('hidden');
     dom.resultStudentKeywords.classList.add('hidden');
     dom.studentImageStatus.textContent = 'Waiting for transcript...';
@@ -1601,19 +1911,19 @@ async function finishTest() {
 
     try {
       const transcribed = await transcribeRecordedAudio(audioCapture.blob, audioCapture.mimeType);
+      if (state.sessionGeneration !== gen) return;
       if (transcribed) {
-        spokenText = state.prefixTranscript
-          ? `${state.prefixTranscript} ${transcribed}`.trim()
-          : transcribed;
+        appendTranscriptText(transcribed);
       }
     } catch (err) {
-      if (!spokenText) {
+      if (!state.finalTranscript.trim()) {
         transcriptionError =
           err instanceof Error ? err.message : 'Unable to transcribe recorded audio.';
       }
     }
   }
 
+  const spokenText = state.finalTranscript.trim();
   state.lastSpokenText = spokenText;
   dom.resultTranscriptText.textContent =
     spokenText || 'No spoken transcript was recorded during the test.';
