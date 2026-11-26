@@ -40,6 +40,8 @@ const state = {
   hasFatalSpeechError: false,
   hasNativeSpeechResult: false,
   lastLiveSpeechResultAt: 0,
+  nativeBackupBuffer: '',
+  noiseFloor: 0.004,
   transcribeQueue: Promise.resolve(),
   pendingTranscribeCount: 0,
   pcmCaptureEnabled: false,
@@ -129,6 +131,7 @@ const dom = {
   resultOriginalImage: document.getElementById('result-original-image'),
   resultOriginalFallback: document.getElementById('result-original-fallback'),
   listenSceneBtn: document.getElementById('listen-scene-btn'),
+  listenBtnLabel: document.getElementById('listen-btn-label'),
   listenSceneStatus: document.getElementById('listen-scene-status'),
   studentImageStatus: document.getElementById('student-image-status'),
   studentImageLoading: document.getElementById('student-image-loading'),
@@ -227,13 +230,13 @@ function setMicState(mode, label) {
 }
 
 function updateTranscriptDisplay() {
-  const combined = `${state.finalTranscript} ${state.interimTranscript}`.trim();
+  const previewTail = `${state.nativeBackupBuffer} ${state.interimTranscript}`.trim();
+  const combined = `${state.finalTranscript} ${previewTail}`.trim();
   const hasText = combined.length > 0;
 
   dom.transcriptPlaceholder.classList.toggle('hidden', hasText);
   dom.finalTranscriptEl.textContent = state.finalTranscript;
-  dom.interimTranscriptEl.textContent =
-    state.interimTranscript ? ` ${state.interimTranscript}` : '';
+  dom.interimTranscriptEl.textContent = previewTail ? ` ${previewTail}` : '';
 
   const wordCount = combined ? combined.split(/\s+/).filter(Boolean).length : 0;
   dom.wordCountEl.textContent = String(wordCount);
@@ -284,10 +287,13 @@ function appendTranscriptText(newSegment) {
 }
 
 function commitInterimTranscript() {
-  if (state.interimTranscript) {
-    const pending = state.interimTranscript;
-    state.interimTranscript = '';
+  const pending = `${state.nativeBackupBuffer} ${state.interimTranscript}`.trim();
+  state.nativeBackupBuffer = '';
+  state.interimTranscript = '';
+  if (pending) {
     appendTranscriptText(pending);
+  } else {
+    updateTranscriptDisplay();
   }
 }
 
@@ -469,17 +475,24 @@ function resetPcmSegmentBuffer() {
 }
 
 function flushCurrentPcmSegment(forceFlush = false) {
-  const minSamples = forceFlush ? 16000 * 0.35 : 16000 * 0.6;
+  const minSamples = forceFlush ? 16000 * 0.3 : 16000 * 0.5;
   if (!state.segmentHasSpeech || state.currentSegmentSamples < minSamples) {
     resetPcmSegmentBuffer();
     return;
   }
 
   const chunks = state.currentSegmentChunks.slice();
+  const backupNativeText = state.nativeBackupBuffer.trim();
+  state.nativeBackupBuffer = '';
   resetPcmSegmentBuffer();
 
   const wavBlob = encodeWavBlob(chunks, 16000);
-  if (wavBlob.size < 2000) return;
+  if (wavBlob.size < 2000) {
+    if (backupNativeText) {
+      appendTranscriptText(backupNativeText);
+    }
+    return;
+  }
 
   const gen = state.sessionGeneration;
   state.pendingTranscribeCount += 1;
@@ -490,14 +503,15 @@ function flushCurrentPcmSegment(forceFlush = false) {
   state.transcribeQueue = state.transcribeQueue
     .then(async () => {
       if (state.sessionGeneration !== gen) return;
+      const previousContext = state.finalTranscript.trim().slice(-180);
       let text = '';
       try {
-        text = await transcribeRecordedAudio(wavBlob, 'audio/wav');
+        text = await transcribeRecordedAudio(wavBlob, 'audio/wav', previousContext);
       } catch {
         // Quick single retry for transient network hiccups
         if (state.sessionGeneration === gen) {
           try {
-            text = await transcribeRecordedAudio(wavBlob, 'audio/wav');
+            text = await transcribeRecordedAudio(wavBlob, 'audio/wav', previousContext);
           } catch {
             text = '';
           }
@@ -505,12 +519,17 @@ function flushCurrentPcmSegment(forceFlush = false) {
       }
 
       if (state.sessionGeneration !== gen) return;
-      if (text) {
-        state.pcmProducedTranscript = true;
-        appendTranscriptText(text);
+      const chosenSegment = text || backupNativeText;
+      if (chosenSegment) {
+        if (text) {
+          state.pcmProducedTranscript = true;
+        }
+        appendTranscriptText(chosenSegment);
         if (state.currentScreen === 'results') {
           dom.resultTranscriptText.textContent = state.finalTranscript;
         }
+      } else {
+        updateTranscriptDisplay();
       }
     })
     .finally(() => {
@@ -521,11 +540,7 @@ function flushCurrentPcmSegment(forceFlush = false) {
         state.pendingTranscribeCount === 0 &&
         state.isAudioRecording
       ) {
-        const useAiLabel =
-          IS_MOBILE_BROWSER ||
-          state.hasFatalSpeechError ||
-          !(window.SpeechRecognition || window['webkitSpeechRecognition']);
-        setMicState('listening', useAiLabel ? 'Listening (Live voice capture)' : 'Listening');
+        setMicState('listening', 'Listening — speak clearly');
       }
     });
 }
@@ -667,33 +682,19 @@ function startAudioMeterAndPcm(stream) {
         }
         const rms = Math.sqrt(sumSquares / inputData.length);
 
-        const nativeRecentlyActive =
-          !IS_MOBILE_BROWSER &&
-          !state.hasFatalSpeechError &&
-          state.hasNativeSpeechResult &&
-          Date.now() - state.lastLiveSpeechResultAt < 3500;
-
         const int16Chunk = downsampleTo16kInt16(inputData, sampleRate);
         if (int16Chunk.length === 0) return;
 
-        if (nativeRecentlyActive) {
-          state.pcmPreRollChunks.push(int16Chunk);
-          if (state.pcmPreRollChunks.length > 4) {
-            state.pcmPreRollChunks.shift();
-          }
-          if (state.segmentHasSpeech) {
-            state.currentSegmentChunks = [];
-            state.currentSegmentSamples = 0;
-            state.segmentHasSpeech = false;
-            state.segmentSilenceMs = 0;
-          }
-          return;
+        // Adaptive noise floor so quiet laptop/phone microphones still capture soft consonants
+        if (!state.segmentHasSpeech) {
+          state.noiseFloor = state.noiseFloor * 0.92 + Math.min(rms, 0.02) * 0.08;
         }
+        const speechThreshold = Math.max(0.0045, Math.min(0.016, state.noiseFloor * 2.2));
+        const isSpeechFrame = rms > speechThreshold;
 
-        const isSpeechFrame = rms > 0.011;
         if (!state.segmentHasSpeech) {
           state.pcmPreRollChunks.push(int16Chunk);
-          if (state.pcmPreRollChunks.length > 4) {
+          if (state.pcmPreRollChunks.length > 5) {
             state.pcmPreRollChunks.shift();
           }
           if (isSpeechFrame) {
@@ -719,10 +720,12 @@ function startAudioMeterAndPcm(stream) {
         }
 
         const reachedNaturalPause =
-          state.currentSegmentSamples >= 16000 * 1.0 && state.segmentSilenceMs >= 650;
-        const reachedMaxLength = state.currentSegmentSamples >= 16000 * 4.5;
+          state.currentSegmentSamples >= 16000 * 0.9 && state.segmentSilenceMs >= 500;
+        const reachedSoftGapSplit =
+          state.currentSegmentSamples >= 16000 * 3.8 && rms < speechThreshold * 1.25;
+        const reachedMaxLength = state.currentSegmentSamples >= 16000 * 6.0;
 
-        if (reachedNaturalPause || reachedMaxLength) {
+        if (reachedNaturalPause || reachedSoftGapSplit || reachedMaxLength) {
           flushCurrentPcmSegment(false);
         }
       };
@@ -778,9 +781,14 @@ async function startAudioCapture(deviceId = '') {
 
   let stream = null;
   try {
+    const audioOpts = {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
     const constraints = deviceId
-      ? { audio: { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true } }
-      : { audio: { echoCancellation: true, noiseSuppression: true } };
+      ? { audio: { deviceId: { exact: deviceId }, ...audioOpts } }
+      : { audio: audioOpts };
     try {
       stream = await navigator.mediaDevices.getUserMedia(constraints);
     } catch {
@@ -894,7 +902,7 @@ function stopAudioCaptureAndGetBlob() {
         settled = true;
         finalize();
       }
-    }, 1500);
+    }, 450);
 
     recorder.onstop = () => {
       if (!settled) {
@@ -933,7 +941,7 @@ function blobToBase64(blob) {
   });
 }
 
-async function transcribeRecordedAudio(blob, mimeType) {
+async function transcribeRecordedAudio(blob, mimeType, previousText = '') {
   const audioBase64 = await blobToBase64(blob);
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), 30000);
@@ -942,7 +950,7 @@ async function transcribeRecordedAudio(blob, mimeType) {
     const response = await fetch('/api/transcribe', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ audioBase64, mimeType }),
+      body: JSON.stringify({ audioBase64, mimeType, previousText }),
       signal: controller.signal,
     });
     const data = await response.json().catch(() => ({}));
@@ -1015,17 +1023,24 @@ function startSpeechRecognition() {
     state.hasNativeSpeechResult = true;
     state.lastLiveSpeechResultAt = Date.now();
     hideError(dom.speechWarning);
-    setMicState('listening', 'Listening');
+    if (state.pendingTranscribeCount === 0) {
+      setMicState('listening', 'Listening');
+    }
 
     let interim = '';
     for (let i = event.resultIndex; i < event.results.length; i += 1) {
       const result = event.results[i];
-      const transcriptPiece = result[0]?.transcript || '';
+      const transcriptPiece = (result[0]?.transcript || '').trim();
+      if (!transcriptPiece) continue;
       if (result.isFinal) {
-        appendTranscriptText(transcriptPiece);
-        resetPcmSegmentBuffer();
+        // Hold as live preview backup until the high-accuracy 16kHz WAV segment commits (or use directly if no PCM segment active)
+        if (state.pcmCaptureEnabled) {
+          state.nativeBackupBuffer = `${state.nativeBackupBuffer} ${transcriptPiece}`.trim();
+        } else {
+          appendTranscriptText(transcriptPiece);
+        }
       } else {
-        interim += transcriptPiece;
+        interim += ` ${transcriptPiece}`;
       }
     }
     state.interimTranscript = interim.trim();
@@ -1090,7 +1105,15 @@ function startSpeechRecognition() {
   };
 
   recognition.onend = () => {
-    commitInterimTranscript();
+    if (state.interimTranscript) {
+      if (state.pcmCaptureEnabled) {
+        state.nativeBackupBuffer = `${state.nativeBackupBuffer} ${state.interimTranscript}`.trim();
+        state.interimTranscript = '';
+        updateTranscriptDisplay();
+      } else {
+        commitInterimTranscript();
+      }
+    }
 
     if (state.isTesting && !state.hasFatalSpeechError && state.recognition === recognition) {
       window.setTimeout(() => {
@@ -1162,6 +1185,8 @@ function resetTestView() {
   state.hasFatalSpeechError = false;
   state.hasNativeSpeechResult = false;
   state.lastLiveSpeechResultAt = 0;
+  state.nativeBackupBuffer = '';
+  state.noiseFloor = 0.004;
   state.pendingTranscribeCount = 0;
   state.transcribeQueue = Promise.resolve();
   state.pcmProducedTranscript = false;
@@ -1194,6 +1219,18 @@ function resetTestView() {
   updateTranscriptDisplay();
 }
 
+function setListenButtonState(mode, labelText) {
+  if (dom.listenBtnLabel) {
+    dom.listenBtnLabel.textContent = labelText;
+  } else if (dom.listenSceneBtn) {
+    dom.listenSceneBtn.textContent = labelText;
+  }
+  if (dom.listenSceneBtn) {
+    dom.listenSceneBtn.classList.toggle('is-loading', mode === 'loading');
+    dom.listenSceneBtn.classList.toggle('is-playing', mode === 'playing');
+  }
+}
+
 function stopSceneAudio() {
   state.isSceneAudioLoading = false;
   state.isSceneAudioPlaying = false;
@@ -1215,8 +1252,8 @@ function stopSceneAudio() {
   }
   if (dom.listenSceneBtn) {
     dom.listenSceneBtn.disabled = false;
-    dom.listenSceneBtn.textContent = 'Listen to Description';
   }
+  setListenButtonState('idle', 'Listen to Description');
   if (dom.listenSceneStatus) {
     dom.listenSceneStatus.textContent = 'Random male or female voice';
   }
@@ -1254,8 +1291,8 @@ function speakWithBrowserFallback(text) {
   state.isSceneAudioPlaying = true;
   if (dom.listenSceneBtn) {
     dom.listenSceneBtn.disabled = false;
-    dom.listenSceneBtn.textContent = 'Stop Voice';
   }
+  setListenButtonState('playing', 'Stop Voice');
   if (dom.listenSceneStatus) {
     dom.listenSceneStatus.textContent = `Playing (${chosenLabel})`;
   }
@@ -1287,8 +1324,8 @@ async function toggleSceneAudioDescription() {
   state.isSceneAudioLoading = true;
   if (dom.listenSceneBtn) {
     dom.listenSceneBtn.disabled = true;
-    dom.listenSceneBtn.textContent = 'Loading voice...';
   }
+  setListenButtonState('loading', 'Loading voice...');
   if (dom.listenSceneStatus) {
     dom.listenSceneStatus.textContent = 'Generating voice description...';
   }
@@ -1325,8 +1362,8 @@ async function toggleSceneAudioDescription() {
     const genderLabel = data.voiceGender === 'male' ? 'Male voice' : 'Female voice';
     if (dom.listenSceneBtn) {
       dom.listenSceneBtn.disabled = false;
-      dom.listenSceneBtn.textContent = 'Stop Voice';
     }
+    setListenButtonState('playing', 'Stop Voice');
     if (dom.listenSceneStatus) {
       dom.listenSceneStatus.textContent = `Playing (${genderLabel})`;
     }
@@ -1841,9 +1878,16 @@ async function finishTest() {
   state.isTesting = false;
   dom.finishEarlyBtn.disabled = true;
   cleanupTimers();
-  commitInterimTranscript();
   stopSpeechRecognition();
+  if (state.interimTranscript) {
+    state.nativeBackupBuffer = `${state.nativeBackupBuffer} ${state.interimTranscript}`.trim();
+    state.interimTranscript = '';
+  }
   flushCurrentPcmSegment(true);
+  if (state.nativeBackupBuffer) {
+    appendTranscriptText(state.nativeBackupBuffer);
+    state.nativeBackupBuffer = '';
+  }
   setMicState('idle', 'Finishing recording...');
 
   const audioCapture = await stopAudioCaptureAndGetBlob();

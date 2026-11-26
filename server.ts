@@ -423,8 +423,8 @@ async function generateWithRetry(
   }
 ): Promise<string> {
   const attempts: Array<{ model: string; thinkingLevel: ThinkingLevel; delayMs: number }> = [
-    { model: FALLBACK_MODEL, thinkingLevel: ThinkingLevel.MEDIUM, delayMs: 0 },
-    { model: FALLBACK_MODEL, thinkingLevel: ThinkingLevel.LOW, delayMs: 700 },
+    { model: PRIMARY_MODEL, thinkingLevel: ThinkingLevel.LOW, delayMs: 0 },
+    { model: FALLBACK_MODEL, thinkingLevel: ThinkingLevel.LOW, delayMs: 250 },
     { model: PRIMARY_MODEL, thinkingLevel: ThinkingLevel.MINIMAL, delayMs: 400 },
   ];
 
@@ -752,10 +752,18 @@ async function startServer(): Promise<void> {
     express.json({ limit: '8mb' }),
     async (req: Request, res: Response) => {
       try {
-        const body = req.body as { audioBase64?: unknown; mimeType?: unknown };
+        const body = req.body as {
+          audioBase64?: unknown;
+          mimeType?: unknown;
+          previousText?: unknown;
+        };
         const audioBase64 = typeof body?.audioBase64 === 'string' ? body.audioBase64.trim() : '';
         const rawMime = typeof body?.mimeType === 'string' ? body.mimeType.trim() : 'audio/webm';
         const cleanMime = rawMime.split(';')[0].trim().toLowerCase();
+        const previousText =
+          typeof body?.previousText === 'string'
+            ? body.previousText.trim().slice(-220)
+            : '';
 
         const allowedMimes = new Set([
           'audio/webm',
@@ -785,8 +793,11 @@ async function startServer(): Promise<void> {
             data: audioBase64,
           },
         };
+        const contextHint = previousText
+          ? ` Prior words spoken right before this clip (do NOT repeat them, use only for sentence continuity): "${previousText}".`
+          : '';
         const instructionPart = {
-          text: 'Transcribe only the clear English speech in this audio clip accurately as plain text with natural punctuation. Do not add commentary, speaker labels, timestamps, or brackets. If there is no clear speech, output an empty string.',
+          text: `Transcribe the exact English words spoken by the student in this audio clip (including any natural accent or minor grammar mistakes, without changing their meaning).${contextHint} Output only the newly spoken plain text with natural punctuation. Do not add commentary, labels, or brackets. If there is no clear speech, output an empty string.`,
         };
 
         const modelsToTry = ['gemini-3.5-transcribe', PRIMARY_MODEL];
